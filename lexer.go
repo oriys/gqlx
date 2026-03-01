@@ -98,13 +98,6 @@ var punctuatorKind = [256]TokenKind{
 	'{': TokenBraceL, '|': TokenPipe, '}': TokenBraceR,
 }
 
-func (l *Lexer) singleCharToken(kind TokenKind) Token {
-	tok := Token{Kind: kind, Value: punctuatorStrings[l.source[l.pos]], Line: l.line, Col: l.col}
-	l.pos++
-	l.col++
-	return tok
-}
-
 func (l *Lexer) advance(n int) {
 	for i := 0; i < n && l.pos < len(l.source); i++ {
 		if l.source[l.pos] == '\n' {
@@ -150,14 +143,6 @@ func (l *Lexer) skipIgnored() {
 		}
 	}
 	l.pos = pos
-}
-
-func (l *Lexer) skipComment() {
-	// Skip from '#' to end of line
-	l.advance(1) // skip '#'
-	for l.pos < len(l.source) && l.source[l.pos] != '\n' && l.source[l.pos] != '\r' {
-		l.advance(1)
-	}
 }
 
 func (l *Lexer) readName() Token {
@@ -230,7 +215,7 @@ func (l *Lexer) readNumber() (Token, error) {
 	if isFloat {
 		kind = TokenFloat
 	}
-	return Token{Kind: TokenKind(kind), Value: l.source[start:l.pos], Line: startLine, Col: startCol}, nil
+	return Token{Kind: kind, Value: l.source[start:l.pos], Line: startLine, Col: startCol}, nil
 }
 
 func (l *Lexer) readString() (Token, error) {

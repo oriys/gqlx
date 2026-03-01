@@ -317,7 +317,7 @@ func (ctx *executionContext) completeValue(typ GraphQLType, fieldNodes []*Field,
 		completed := ctx.completeValue(nn.OfType, fieldNodes, result, path)
 		if completed == nil {
 			ctx.addError(
-				fmt.Sprintf("Cannot return null for non-nullable field."),
+				"Cannot return null for non-nullable field.",
 				fieldNodes[0].Loc, path)
 			return nil
 		}
@@ -457,10 +457,7 @@ func (ctx *executionContext) completeObjectValue(objectType *ObjectType, fieldNo
 	return ctx.executeFields(objectType, result, subSelections, path)
 }
 
-func (ctx *executionContext) handleNullPropagation(typ GraphQLType) interface{} {
-	if _, ok := typ.(*NonNullOfType); ok {
-		return nil
-	}
+func (ctx *executionContext) handleNullPropagation(_ GraphQLType) interface{} {
 	return nil
 }
 
@@ -576,21 +573,18 @@ func buildIntrospectionSchema(schema *Schema) map[string]interface{} {
 	result["types"] = types
 
 	// queryType
-	b2 := newIntrospectionBuilder()
-	result["queryType"] = b2.buildTypeObj(schema.QueryType)
+	result["queryType"] = b.buildTypeObj(schema.QueryType)
 
 	// mutationType
 	if schema.MutationType != nil {
-		b3 := newIntrospectionBuilder()
-		result["mutationType"] = b3.buildTypeObj(schema.MutationType)
+		result["mutationType"] = b.buildTypeObj(schema.MutationType)
 	} else {
 		result["mutationType"] = nil
 	}
 
 	// subscriptionType
 	if schema.SubscriptionType != nil {
-		b4 := newIntrospectionBuilder()
-		result["subscriptionType"] = b4.buildTypeObj(schema.SubscriptionType)
+		result["subscriptionType"] = b.buildTypeObj(schema.SubscriptionType)
 	} else {
 		result["subscriptionType"] = nil
 	}

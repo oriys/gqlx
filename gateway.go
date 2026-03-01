@@ -1,6 +1,9 @@
 package gqlx
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Gateway composes multiple subgraphs into a unified federated API.
 type Gateway struct {
@@ -252,7 +255,7 @@ func (g *Gateway) detectEntityCycles(mergedObjects map[string]*ObjectType) error
 		}
 		refs := make(map[string]bool)
 		for _, fd := range obj.Fields_ {
-			refType := unwrapToNamed(fd.Type)
+			refType := UnwrapType(fd.Type).TypeName()
 			if refType != "" && refType != typeName && entityTypes[refType] {
 				refs[refType] = true
 			}
@@ -314,31 +317,9 @@ func (g *Gateway) detectEntityCycles(mergedObjects map[string]*ObjectType) error
 	return nil
 }
 
-// unwrapToNamed extracts the named type from wrapper types (NonNull, List).
-func unwrapToNamed(typ GraphQLType) string {
-	switch t := typ.(type) {
-	case *NonNullOfType:
-		return unwrapToNamed(t.OfType)
-	case *ListOfType:
-		return unwrapToNamed(t.OfType)
-	case *ObjectType:
-		return t.Name_
-	default:
-		return ""
-	}
-}
-
 // formatCycle formats a cycle path for error messages.
 func formatCycle(cycle []string) string {
-	result := ""
-	for i, name := range cycle {
-		if i > 0 {
-			result += " → "
-		}
-		result += name
-	}
-	result += " → " + cycle[0]
-	return result
+	return strings.Join(append(cycle, cycle[0]), " → ")
 }
 
 // wireRootResolvers ensures root query/mutation fields have resolvers from their owning subgraphs.
@@ -374,7 +355,7 @@ func makeEntityFieldResolver(typeName, fieldName string, sg *Subgraph, entity *E
 	return func(p ResolveParams) (interface{}, error) {
 		source, ok := p.Source.(map[string]interface{})
 		if !ok {
-			return defaultResolveField(p.Source, fieldName), nil
+			return resolveFieldValue(p.Source, fieldName), nil
 		}
 
 		// Fast path: field already in source (same subgraph provided it)
@@ -415,19 +396,8 @@ func makeEntityFieldResolver(typeName, fieldName string, sg *Subgraph, entity *E
 			return resolvedMap[fieldName], nil
 		}
 
-		return defaultResolveField(resolved, fieldName), nil
+		return resolveFieldValue(resolved, fieldName), nil
 	}
-}
-
-// defaultResolveField extracts a field value from an arbitrary source using reflection.
-func defaultResolveField(source interface{}, fieldName string) interface{} {
-	if source == nil {
-		return nil
-	}
-	if m, ok := source.(map[string]interface{}); ok {
-		return m[fieldName]
-	}
-	return resolveFieldValue(source, fieldName)
 }
 
 // rewriteTypeRef rewrites type references to use merged ObjectType instances.
@@ -454,7 +424,12 @@ func rewriteArgs(args ArgumentMap, merged map[string]*ObjectType) ArgumentMap {
 	}
 	result := make(ArgumentMap, len(args))
 	for k, v := range args {
-		result[k] = v
+		result[k] = &ArgumentDefinition{
+			Name_:        v.Name_,
+			Description:  v.Description,
+			Type:         rewriteTypeRef(v.Type, merged),
+			DefaultValue: v.DefaultValue,
+		}
 	}
 	return result
 }
