@@ -6,6 +6,7 @@ import "fmt"
 type Gateway struct {
 	subgraphs  []*Subgraph
 	supergraph *Schema
+	maxDepth   int
 	// fieldOwner tracks which subgraph provides each field: typeName -> fieldName -> subgraph
 	fieldOwner map[string]map[string]*Subgraph
 }
@@ -13,7 +14,11 @@ type Gateway struct {
 // GatewayConfig is the configuration for creating a gateway.
 type GatewayConfig struct {
 	Subgraphs []*Subgraph
+	MaxDepth  int // default 12; max 12
 }
+
+// DefaultMaxFederationDepth is the default (and maximum) allowed query depth.
+const DefaultMaxFederationDepth = 12
 
 // NewGateway creates a federated gateway by composing multiple subgraph schemas.
 func NewGateway(config GatewayConfig) (*Gateway, error) {
@@ -21,8 +26,17 @@ func NewGateway(config GatewayConfig) (*Gateway, error) {
 		return nil, fmt.Errorf("gateway requires at least one subgraph")
 	}
 
+	maxDepth := config.MaxDepth
+	if maxDepth <= 0 {
+		maxDepth = DefaultMaxFederationDepth
+	}
+	if maxDepth > DefaultMaxFederationDepth {
+		maxDepth = DefaultMaxFederationDepth
+	}
+
 	g := &Gateway{
 		subgraphs:  config.Subgraphs,
+		maxDepth:   maxDepth,
 		fieldOwner: make(map[string]map[string]*Subgraph),
 	}
 
@@ -41,7 +55,27 @@ func (g *Gateway) Schema() *Schema {
 
 // Execute parses, validates, and executes a query against the federated supergraph.
 func (g *Gateway) Execute(query string, variables map[string]interface{}, operationName string) *Result {
-	return Do(g.supergraph, query, variables, operationName)
+	if g.supergraph == nil {
+		return &Result{Errors: []*GraphQLError{{Message: "Must provide schema"}}}
+	}
+
+	doc, err := Parse(query)
+	if err != nil {
+		return &Result{Errors: []*GraphQLError{FormatError(err)}}
+	}
+
+	validationErrors := Validate(g.supergraph, doc)
+	if len(validationErrors) > 0 {
+		return &Result{Errors: validationErrors}
+	}
+
+	return Execute(ExecuteParams{
+		Schema:        g.supergraph,
+		Document:      doc,
+		Variables:     variables,
+		OperationName: operationName,
+		MaxDepth:      g.maxDepth,
+	})
 }
 
 // compose builds the supergraph schema by merging all subgraph schemas.
@@ -137,7 +171,12 @@ func (g *Gateway) compose() (*Schema, error) {
 		}
 	}
 
-	// Phase 4: Build merged Query and Mutation types
+	// Phase 4: Detect entity reference cycles
+	if err := g.detectEntityCycles(mergedObjects); err != nil {
+		return nil, err
+	}
+
+	// Phase 5: Build merged Query and Mutation types
 	var queryType, mutationType *ObjectType
 
 	for _, sg := range g.subgraphs {
@@ -165,7 +204,7 @@ func (g *Gateway) compose() (*Schema, error) {
 		wireRootResolvers(mutationType, g.fieldOwner, g.subgraphs, false)
 	}
 
-	// Phase 5: Collect additional types for schema
+	// Phase 6: Collect additional types for schema
 	var additionalTypes []GraphQLType
 	for name, obj := range mergedObjects {
 		if queryType != nil && name == queryType.Name_ {
@@ -188,6 +227,118 @@ func (g *Gateway) compose() (*Schema, error) {
 		Mutation: mutationType,
 		Types:    additionalTypes,
 	})
+}
+
+// detectEntityCycles checks for circular entity references across subgraphs.
+// For example: User has orders (→Order), Order has product (→Product), Product has user (→User) = cycle.
+// It builds a directed graph of entity type references and detects cycles using DFS.
+func (g *Gateway) detectEntityCycles(mergedObjects map[string]*ObjectType) error {
+	// Build adjacency list: typeName -> set of referenced entity type names
+	adj := make(map[string]map[string]bool)
+	entityTypes := make(map[string]bool)
+
+	// Collect all entity type names across subgraphs
+	for _, sg := range g.subgraphs {
+		for typeName := range sg.Entities {
+			entityTypes[typeName] = true
+		}
+	}
+
+	// For each entity type, find which other entity types it references via object fields
+	for typeName := range entityTypes {
+		obj, ok := mergedObjects[typeName]
+		if !ok {
+			continue
+		}
+		refs := make(map[string]bool)
+		for _, fd := range obj.Fields_ {
+			refType := unwrapToNamed(fd.Type)
+			if refType != "" && refType != typeName && entityTypes[refType] {
+				refs[refType] = true
+			}
+		}
+		if len(refs) > 0 {
+			adj[typeName] = refs
+		}
+	}
+
+	// DFS cycle detection
+	const (
+		white = 0 // unvisited
+		gray  = 1 // in current path
+		black = 2 // fully processed
+	)
+	color := make(map[string]int)
+	parent := make(map[string]string)
+
+	var dfs func(node string) []string
+	dfs = func(node string) []string {
+		color[node] = gray
+		for neighbor := range adj[node] {
+			if color[neighbor] == gray {
+				// Found cycle - reconstruct it
+				cycle := []string{neighbor, node}
+				cur := node
+				for cur != neighbor {
+					cur = parent[cur]
+					if cur == "" {
+						break
+					}
+					cycle = append(cycle, cur)
+				}
+				// Reverse to get readable order
+				for i, j := 0, len(cycle)-1; i < j; i, j = i+1, j-1 {
+					cycle[i], cycle[j] = cycle[j], cycle[i]
+				}
+				return cycle
+			}
+			if color[neighbor] == white {
+				parent[neighbor] = node
+				if cycle := dfs(neighbor); cycle != nil {
+					return cycle
+				}
+			}
+		}
+		color[node] = black
+		return nil
+	}
+
+	for typeName := range entityTypes {
+		if color[typeName] == white {
+			if cycle := dfs(typeName); cycle != nil {
+				return fmt.Errorf("federation: entity reference cycle detected: %s", formatCycle(cycle))
+			}
+		}
+	}
+
+	return nil
+}
+
+// unwrapToNamed extracts the named type from wrapper types (NonNull, List).
+func unwrapToNamed(typ GraphQLType) string {
+	switch t := typ.(type) {
+	case *NonNullOfType:
+		return unwrapToNamed(t.OfType)
+	case *ListOfType:
+		return unwrapToNamed(t.OfType)
+	case *ObjectType:
+		return t.Name_
+	default:
+		return ""
+	}
+}
+
+// formatCycle formats a cycle path for error messages.
+func formatCycle(cycle []string) string {
+	result := ""
+	for i, name := range cycle {
+		if i > 0 {
+			result += " → "
+		}
+		result += name
+	}
+	result += " → " + cycle[0]
+	return result
 }
 
 // wireRootResolvers ensures root query/mutation fields have resolvers from their owning subgraphs.

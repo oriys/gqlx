@@ -2,6 +2,7 @@ package gqlx
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -1193,4 +1194,432 @@ func copyMap(m map[string]interface{}) map[string]interface{} {
 		c[k] = v
 	}
 	return c
+}
+
+// ============================================================
+// Deep federation helpers & tests (up to 12 levels, cycle detection)
+// ============================================================
+
+// makeChainSubgraphs creates a linear chain of N subgraphs: Level0 → Level1 → ... → Level(N-1).
+// Each LevelK type has fields: id, name, and a "child" field referencing Level(K+1) (except the last).
+func makeChainSubgraphs(n int) []*Subgraph {
+	if n < 1 || n > 12 {
+		panic("chain depth must be 1..12")
+	}
+
+	// Pre-build type names and test data
+	typeNames := make([]string, n)
+	data := make([]map[string]map[string]interface{}, n)
+	for i := 0; i < n; i++ {
+		typeNames[i] = fmt.Sprintf("Level%d", i)
+		data[i] = map[string]map[string]interface{}{
+			"1": {"id": "1", "name": fmt.Sprintf("item-%d-1", i)},
+			"2": {"id": "2", "name": fmt.Sprintf("item-%d-2", i)},
+		}
+		if i < n-1 {
+			// Add childId to link to next level
+			data[i]["1"]["childId"] = "1"
+			data[i]["2"]["childId"] = "2"
+		}
+	}
+
+	subgraphs := make([]*Subgraph, n)
+
+	for i := 0; i < n; i++ {
+		idx := i
+		typeName := typeNames[idx]
+		localData := data[idx]
+
+		fields := FieldMap{
+			"id":   {Type: NewNonNull(IDScalar)},
+			"name": {Type: NewNonNull(StringScalar)},
+		}
+
+		objType := &ObjectType{Name_: typeName, Fields_: fields}
+
+		var entities []EntityConfig
+		var extraTypes []GraphQLType
+
+		if idx > 0 {
+			// This subgraph extends the previous type with a "child" field pointing to its type
+			prevTypeName := typeNames[idx-1]
+			prevData := data[idx-1]
+			prevType := &ObjectType{
+				Name_: prevTypeName,
+				Fields_: FieldMap{
+					"id": {Type: NewNonNull(IDScalar)},
+					"child": {
+						Type: objType,
+						Resolve: func(p ResolveParams) (interface{}, error) {
+							source, _ := p.Source.(map[string]interface{})
+							childId, _ := source["childId"].(string)
+							if d, ok := localData[childId]; ok {
+								return copyMap(d), nil
+							}
+							return nil, nil
+						},
+					},
+				},
+			}
+			extraTypes = append(extraTypes, prevType)
+
+			entities = append(entities, EntityConfig{
+				TypeName:  prevTypeName,
+				KeyFields: []string{"id"},
+				Resolver: func(repr map[string]interface{}) (interface{}, error) {
+					prevId, _ := repr["id"].(string)
+					d := prevData[prevId]
+					if d == nil {
+						return nil, fmt.Errorf("%s %q not found", prevTypeName, prevId)
+					}
+					c := copyMap(d)
+					childId, _ := c["childId"].(string)
+					if childId != "" {
+						if cd, ok := localData[childId]; ok {
+							c["child"] = copyMap(cd)
+						}
+					}
+					return c, nil
+				},
+			})
+		}
+
+		queryFields := FieldMap{
+			fmt.Sprintf("get%s", typeName): {
+				Type: objType,
+				Args: ArgumentMap{"id": {Name_: "id", Type: NewNonNull(IDScalar)}},
+				Resolve: func(p ResolveParams) (interface{}, error) {
+					id, _ := p.Args["id"].(string)
+					if d, ok := localData[id]; ok {
+						return copyMap(d), nil
+					}
+					return nil, nil
+				},
+			},
+		}
+
+		sg, err := NewSubgraph(SubgraphConfig{
+			Name: fmt.Sprintf("sg%d", idx),
+			Schema: SchemaConfig{
+				Query: &ObjectType{Name_: "Query", Fields_: queryFields},
+				Types: append([]GraphQLType{objType}, extraTypes...),
+			},
+			Entities: entities,
+		})
+		if err != nil {
+			panic(fmt.Sprintf("makeChainSubgraphs(%d) sg%d: %v", n, idx, err))
+		}
+		subgraphs[idx] = sg
+	}
+	return subgraphs
+}
+
+// buildDeepQuery builds a query that descends N levels: getLevel0(id:"1") { name child { name child { ... } } }
+func buildDeepQuery(levels int) string {
+	var sb strings.Builder
+	sb.WriteString("{ getLevel0(id: \"1\") {\n")
+	sb.WriteString("  name\n")
+	for i := 1; i < levels; i++ {
+		sb.WriteString(strings.Repeat("  ", i))
+		sb.WriteString("child {\n")
+		sb.WriteString(strings.Repeat("  ", i+1))
+		sb.WriteString("name\n")
+	}
+	for i := levels - 1; i >= 1; i-- {
+		sb.WriteString(strings.Repeat("  ", i))
+		sb.WriteString("}\n")
+	}
+	sb.WriteString("}}")
+	return sb.String()
+}
+
+func TestFederationDeepChain(t *testing.T) {
+	for _, depth := range []int{4, 6, 8, 10, 12} {
+		t.Run(fmt.Sprintf("%d_levels", depth), func(t *testing.T) {
+			sgs := makeChainSubgraphs(depth)
+			gw, err := NewGateway(GatewayConfig{Subgraphs: sgs})
+			if err != nil {
+				t.Fatalf("gateway creation failed: %v", err)
+			}
+
+			query := buildDeepQuery(depth)
+			result := gw.Execute(query, nil, "")
+			if len(result.Errors) > 0 {
+				t.Fatalf("errors: %v", formatErrors(result.Errors))
+			}
+
+			// Verify the deepest level
+			data, ok := result.Data.(map[string]interface{})
+			if !ok {
+				t.Fatal("expected map data")
+			}
+			current := data["getLevel0"]
+			for i := 0; i < depth-1; i++ {
+				m, ok := current.(map[string]interface{})
+				if !ok {
+					t.Fatalf("level %d: expected map, got %T", i, current)
+				}
+				assertEqual(t, m["name"], fmt.Sprintf("item-%d-1", i))
+				current = m["child"]
+			}
+			lastMap, ok := current.(map[string]interface{})
+			if !ok {
+				t.Fatalf("last level: expected map, got %T", current)
+			}
+			assertEqual(t, lastMap["name"], fmt.Sprintf("item-%d-1", depth-1))
+		})
+	}
+}
+
+func TestFederationMaxDepthEnforced(t *testing.T) {
+	t.Run("default_max_depth_12", func(t *testing.T) {
+		// Build a 12-level chain but query 12 levels deep - should work
+		sgs := makeChainSubgraphs(12)
+		gw, err := NewGateway(GatewayConfig{Subgraphs: sgs})
+		if err != nil {
+			t.Fatalf("gateway creation failed: %v", err)
+		}
+		query := buildDeepQuery(12)
+		result := gw.Execute(query, nil, "")
+		if len(result.Errors) > 0 {
+			t.Fatalf("12-level query should succeed, got: %v", formatErrors(result.Errors))
+		}
+	})
+
+	t.Run("custom_max_depth_3", func(t *testing.T) {
+		sgs := makeChainSubgraphs(6)
+		gw, err := NewGateway(GatewayConfig{Subgraphs: sgs, MaxDepth: 3})
+		if err != nil {
+			t.Fatalf("gateway creation failed: %v", err)
+		}
+		// Query 6 levels deep - should fail at depth 3
+		query := buildDeepQuery(6)
+		result := gw.Execute(query, nil, "")
+		if len(result.Errors) == 0 {
+			t.Fatal("expected depth limit error")
+		}
+		found := false
+		for _, e := range result.Errors {
+			if strings.Contains(e.Message, "exceeds maximum allowed depth") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected depth exceeded error, got: %v", formatErrors(result.Errors))
+		}
+	})
+
+	t.Run("max_depth_capped_at_12", func(t *testing.T) {
+		sgs := makeChainSubgraphs(2)
+		gw, err := NewGateway(GatewayConfig{Subgraphs: sgs, MaxDepth: 100})
+		if err != nil {
+			t.Fatalf("gateway creation failed: %v", err)
+		}
+		if gw.maxDepth != 12 {
+			t.Errorf("expected maxDepth capped at 12, got %d", gw.maxDepth)
+		}
+	})
+
+	t.Run("max_depth_default", func(t *testing.T) {
+		sgs := makeChainSubgraphs(2)
+		gw, err := NewGateway(GatewayConfig{Subgraphs: sgs})
+		if err != nil {
+			t.Fatalf("gateway creation failed: %v", err)
+		}
+		if gw.maxDepth != 12 {
+			t.Errorf("expected default maxDepth 12, got %d", gw.maxDepth)
+		}
+	})
+}
+
+func TestFederationCycleDetection(t *testing.T) {
+	t.Run("direct_cycle_A_B_A", func(t *testing.T) {
+		// sgA: owns TypeA {id, name}, registers entity TypeB
+		// sgB: owns TypeB {id, a→TypeA}, extends TypeA with {b→TypeB}, registers entity TypeA
+		// After merge: TypeA→TypeB→TypeA = cycle
+
+		aType := &ObjectType{Name_: "TypeA", Fields_: FieldMap{
+			"id":   {Type: NewNonNull(IDScalar)},
+			"name": {Type: StringScalar},
+		}}
+		bStub := &ObjectType{Name_: "TypeB", Fields_: FieldMap{
+			"id": {Type: NewNonNull(IDScalar)},
+		}}
+		sgA, err := NewSubgraph(SubgraphConfig{
+			Name: "sgA",
+			Schema: SchemaConfig{
+				Query: &ObjectType{Name_: "Query", Fields_: FieldMap{
+					"a": {Type: aType, Args: ArgumentMap{"id": {Name_: "id", Type: NewNonNull(IDScalar)}},
+						Resolve: func(p ResolveParams) (interface{}, error) { return map[string]interface{}{"id": "1"}, nil }},
+				}},
+				Types: []GraphQLType{bStub},
+			},
+			Entities: []EntityConfig{{TypeName: "TypeB", KeyFields: []string{"id"},
+				Resolver: func(repr map[string]interface{}) (interface{}, error) { return repr, nil }}},
+		})
+		if err != nil {
+			t.Fatalf("sgA: %v", err)
+		}
+
+		// sgB: TypeA and TypeB have circular references so collectTypes finds both
+		typeA_B := &ObjectType{Name_: "TypeA", Fields_: FieldMap{"id": {Type: NewNonNull(IDScalar)}}}
+		typeB_B := &ObjectType{Name_: "TypeB", Fields_: FieldMap{
+			"id": {Type: NewNonNull(IDScalar)},
+			"a":  {Type: typeA_B},
+		}}
+		typeA_B.Fields_["b"] = &FieldDefinition{Type: typeB_B}
+
+		sgB, err := NewSubgraph(SubgraphConfig{
+			Name: "sgB",
+			Schema: SchemaConfig{
+				Query: &ObjectType{Name_: "Query", Fields_: FieldMap{
+					"b": {Type: typeB_B, Args: ArgumentMap{"id": {Name_: "id", Type: NewNonNull(IDScalar)}},
+						Resolve: func(p ResolveParams) (interface{}, error) { return map[string]interface{}{"id": "1"}, nil }},
+				}},
+			},
+			Entities: []EntityConfig{{TypeName: "TypeA", KeyFields: []string{"id"},
+				Resolver: func(repr map[string]interface{}) (interface{}, error) { return repr, nil }}},
+		})
+		if err != nil {
+			t.Fatalf("sgB: %v", err)
+		}
+
+		_, gwErr := NewGateway(GatewayConfig{Subgraphs: []*Subgraph{sgA, sgB}})
+		if gwErr == nil {
+			t.Fatal("expected cycle detection error")
+		}
+		if !strings.Contains(gwErr.Error(), "cycle detected") {
+			t.Errorf("expected cycle error, got: %v", gwErr)
+		}
+	})
+
+	t.Run("three_way_cycle", func(t *testing.T) {
+		// CycA → CycB → CycC → CycA (3-way cycle)
+		dummyResolver := func(repr map[string]interface{}) (interface{}, error) {
+			return map[string]interface{}{"id": "1"}, nil
+		}
+
+		// sgA: owns CycA, has CycC.a→CycA (CycC extends with field "a")
+		typeA_A := &ObjectType{Name_: "CycA", Fields_: FieldMap{"id": {Type: NewNonNull(IDScalar)}}}
+		typeC_A := &ObjectType{Name_: "CycC", Fields_: FieldMap{
+			"id": {Type: NewNonNull(IDScalar)},
+			"a":  {Type: typeA_A},
+		}}
+		sgA, _ := NewSubgraph(SubgraphConfig{
+			Name: "sgCycA",
+			Schema: SchemaConfig{
+				Query: &ObjectType{Name_: "Query", Fields_: FieldMap{
+					"cycA": {Type: typeA_A, Args: ArgumentMap{"id": {Name_: "id", Type: NewNonNull(IDScalar)}},
+						Resolve: func(p ResolveParams) (interface{}, error) { return map[string]interface{}{"id": "1"}, nil }},
+				}},
+				Types: []GraphQLType{typeC_A},
+			},
+			Entities: []EntityConfig{{TypeName: "CycC", KeyFields: []string{"id"}, Resolver: dummyResolver}},
+		})
+
+		// sgB: owns CycB, has CycA.b→CycB (CycA extends with field "b")
+		typeB_B := &ObjectType{Name_: "CycB", Fields_: FieldMap{"id": {Type: NewNonNull(IDScalar)}}}
+		typeA_B := &ObjectType{Name_: "CycA", Fields_: FieldMap{
+			"id": {Type: NewNonNull(IDScalar)},
+			"b":  {Type: typeB_B},
+		}}
+		sgB, _ := NewSubgraph(SubgraphConfig{
+			Name: "sgCycB",
+			Schema: SchemaConfig{
+				Query: &ObjectType{Name_: "Query", Fields_: FieldMap{
+					"cycB": {Type: typeB_B, Args: ArgumentMap{"id": {Name_: "id", Type: NewNonNull(IDScalar)}},
+						Resolve: func(p ResolveParams) (interface{}, error) { return map[string]interface{}{"id": "1"}, nil }},
+				}},
+				Types: []GraphQLType{typeA_B},
+			},
+			Entities: []EntityConfig{{TypeName: "CycA", KeyFields: []string{"id"}, Resolver: dummyResolver}},
+		})
+
+		// sgC: owns CycC, has CycB.c→CycC (CycB extends with field "c")
+		typeC_C := &ObjectType{Name_: "CycC", Fields_: FieldMap{"id": {Type: NewNonNull(IDScalar)}}}
+		typeB_C := &ObjectType{Name_: "CycB", Fields_: FieldMap{
+			"id": {Type: NewNonNull(IDScalar)},
+			"c":  {Type: typeC_C},
+		}}
+		sgC, _ := NewSubgraph(SubgraphConfig{
+			Name: "sgCycC",
+			Schema: SchemaConfig{
+				Query: &ObjectType{Name_: "Query", Fields_: FieldMap{
+					"cycC": {Type: typeC_C, Args: ArgumentMap{"id": {Name_: "id", Type: NewNonNull(IDScalar)}},
+						Resolve: func(p ResolveParams) (interface{}, error) { return map[string]interface{}{"id": "1"}, nil }},
+				}},
+				Types: []GraphQLType{typeB_C},
+			},
+			Entities: []EntityConfig{{TypeName: "CycB", KeyFields: []string{"id"}, Resolver: dummyResolver}},
+		})
+
+		_, gwErr := NewGateway(GatewayConfig{Subgraphs: []*Subgraph{sgA, sgB, sgC}})
+		if gwErr == nil {
+			t.Fatal("expected cycle detection error for 3-way cycle")
+		}
+		if !strings.Contains(gwErr.Error(), "cycle detected") {
+			t.Errorf("expected cycle error, got: %v", gwErr)
+		}
+	})
+
+	t.Run("no_cycle_linear_chain", func(t *testing.T) {
+		// Linear chain should NOT trigger cycle detection
+		sgs := makeChainSubgraphs(6)
+		_, err := NewGateway(GatewayConfig{Subgraphs: sgs})
+		if err != nil {
+			t.Fatalf("linear chain should not be detected as cycle: %v", err)
+		}
+	})
+}
+
+func TestFederationExecutorMaxDepth(t *testing.T) {
+	// Test MaxDepth in the executor directly (non-federation use case)
+	schema, err := NewSchema(SchemaConfig{
+		Query: &ObjectType{
+			Name_: "Query",
+			Fields_: FieldMap{
+				"hello": {
+					Type: StringScalar,
+					Resolve: func(p ResolveParams) (interface{}, error) {
+						return "world", nil
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	doc, _ := Parse("{ hello }")
+	result := Execute(ExecuteParams{
+		Schema:   schema,
+		Document: doc,
+		MaxDepth: 1,
+	})
+	// depth=1 path=["hello"] len=1 which is NOT > 1, so should succeed
+	if len(result.Errors) > 0 {
+		t.Fatalf("depth 1 query should succeed at MaxDepth=1, got: %v", formatErrors(result.Errors))
+	}
+	if result.Data.(map[string]interface{})["hello"] != "world" {
+		t.Error("expected hello=world")
+	}
+}
+
+func BenchmarkFederationTwelveLevels(b *testing.B) {
+	sgs := makeChainSubgraphs(12)
+	gw, err := NewGateway(GatewayConfig{Subgraphs: sgs})
+	if err != nil {
+		b.Fatalf("gateway setup failed: %v", err)
+	}
+	query := buildDeepQuery(12)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		result := gw.Execute(query, nil, "")
+		if len(result.Errors) > 0 {
+			b.Fatalf("errors: %v", formatErrors(result.Errors))
+		}
+	}
 }

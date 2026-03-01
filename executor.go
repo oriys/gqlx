@@ -23,6 +23,7 @@ type ExecuteParams struct {
 	RootValue      interface{}
 	Variables      map[string]interface{}
 	OperationName  string
+	MaxDepth       int // 0 means no limit
 }
 
 // Execute executes a GraphQL document.
@@ -91,6 +92,7 @@ func (e *Executor) Execute(params ExecuteParams) *Result {
 		variables: coercedVars,
 		errors:    nil,
 		operation: operation,
+		maxDepth:  params.MaxDepth,
 	}
 
 	rootValue := params.RootValue
@@ -111,6 +113,7 @@ type executionContext struct {
 	variables map[string]interface{}
 	errors    []*GraphQLError
 	operation *OperationDefinition
+	maxDepth  int
 }
 
 func (ctx *executionContext) executeFields(parentType *ObjectType, source interface{}, selections []Selection, path []interface{}) map[string]interface{} {
@@ -425,6 +428,22 @@ func (ctx *executionContext) completeAbstractValue(abstractType GraphQLType, fie
 }
 
 func (ctx *executionContext) completeObjectValue(objectType *ObjectType, fieldNodes []*Field, result interface{}, path []interface{}) interface{} {
+	// Enforce max depth: count only string elements in path (skip list indices)
+	if ctx.maxDepth > 0 {
+		depth := 0
+		for _, p := range path {
+			if _, ok := p.(string); ok {
+				depth++
+			}
+		}
+		if depth > ctx.maxDepth {
+			ctx.addError(
+				fmt.Sprintf("Query depth %d exceeds maximum allowed depth of %d.", depth, ctx.maxDepth),
+				fieldNodes[0].Loc, path)
+			return nil
+		}
+	}
+
 	// Merge sub-selection sets
 	var subSelections []Selection
 	for _, fieldNode := range fieldNodes {
