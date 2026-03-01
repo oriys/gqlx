@@ -58,85 +58,68 @@ func NewSchema(config SchemaConfig) (*Schema, error) {
 		}
 	}
 
-	// Include introspection types so they pass validation
-	introspectionTypes := map[string]*ObjectType{
-		"__Schema": {
-			Name_:       "__Schema",
-			Description: "Built-in introspection type",
-			Fields_: FieldMap{
-				"types":            {Type: NewNonNull(NewList(NewNonNull(&ObjectType{Name_: "__Type"})))},
-				"queryType":        {Type: NewNonNull(&ObjectType{Name_: "__Type"})},
-				"mutationType":     {Type: &ObjectType{Name_: "__Type"}},
-				"subscriptionType": {Type: &ObjectType{Name_: "__Type"}},
-				"directives":       {Type: NewNonNull(NewList(NewNonNull(&ObjectType{Name_: "__Directive"})))},
-				"description":      {Type: StringScalar},
-			},
-		},
-		"__Type": {
-			Name_:       "__Type",
-			Description: "Built-in introspection type",
-			Fields_: FieldMap{
-				"kind":          {Type: NewNonNull(StringScalar)},
-				"name":          {Type: StringScalar},
-				"description":   {Type: StringScalar},
-				"fields":        {Type: NewList(NewNonNull(&ObjectType{Name_: "__Field"})), Args: ArgumentMap{"includeDeprecated": {Name_: "includeDeprecated", Type: BooleanScalar}}},
-				"interfaces":    {Type: NewList(NewNonNull(&ObjectType{Name_: "__Type"}))},
-				"possibleTypes": {Type: NewList(NewNonNull(&ObjectType{Name_: "__Type"}))},
-				"enumValues":    {Type: NewList(NewNonNull(&ObjectType{Name_: "__EnumValue"})), Args: ArgumentMap{"includeDeprecated": {Name_: "includeDeprecated", Type: BooleanScalar}}},
-				"inputFields":   {Type: NewList(NewNonNull(&ObjectType{Name_: "__InputValue"})), Args: ArgumentMap{"includeDeprecated": {Name_: "includeDeprecated", Type: BooleanScalar}}},
-				"ofType":        {Type: &ObjectType{Name_: "__Type"}},
-				"specifiedByURL": {Type: StringScalar},
-			},
-		},
-		"__Field": {
-			Name_:       "__Field",
-			Description: "Built-in introspection type",
-			Fields_: FieldMap{
-				"name":              {Type: NewNonNull(StringScalar)},
-				"description":       {Type: StringScalar},
-				"args":              {Type: NewNonNull(NewList(NewNonNull(&ObjectType{Name_: "__InputValue"})))},
-				"type":              {Type: NewNonNull(&ObjectType{Name_: "__Type"})},
-				"isDeprecated":      {Type: NewNonNull(BooleanScalar)},
-				"deprecationReason": {Type: StringScalar},
-			},
-		},
-		"__InputValue": {
-			Name_:       "__InputValue",
-			Description: "Built-in introspection type",
-			Fields_: FieldMap{
-				"name":              {Type: NewNonNull(StringScalar)},
-				"description":       {Type: StringScalar},
-				"type":              {Type: NewNonNull(&ObjectType{Name_: "__Type"})},
-				"defaultValue":      {Type: StringScalar},
-				"isDeprecated":      {Type: NewNonNull(BooleanScalar)},
-				"deprecationReason": {Type: StringScalar},
-			},
-		},
-		"__EnumValue": {
-			Name_:       "__EnumValue",
-			Description: "Built-in introspection type",
-			Fields_: FieldMap{
-				"name":              {Type: NewNonNull(StringScalar)},
-				"description":       {Type: StringScalar},
-				"isDeprecated":      {Type: NewNonNull(BooleanScalar)},
-				"deprecationReason": {Type: StringScalar},
-			},
-		},
-		"__Directive": {
-			Name_:       "__Directive",
-			Description: "Built-in introspection type",
-			Fields_: FieldMap{
-				"name":         {Type: NewNonNull(StringScalar)},
-				"description":  {Type: StringScalar},
-				"locations":    {Type: NewNonNull(NewList(NewNonNull(StringScalar)))},
-				"args":         {Type: NewNonNull(NewList(NewNonNull(&ObjectType{Name_: "__InputValue"})))},
-				"isRepeatable": {Type: NewNonNull(BooleanScalar)},
-			},
-		},
+	// Include introspection types so they pass validation.
+	// Create types first, then wire up cross-references using actual instances.
+	iSchema := &ObjectType{Name_: "__Schema", Description: "Built-in introspection type"}
+	iType := &ObjectType{Name_: "__Type", Description: "Built-in introspection type"}
+	iField := &ObjectType{Name_: "__Field", Description: "Built-in introspection type"}
+	iInputValue := &ObjectType{Name_: "__InputValue", Description: "Built-in introspection type"}
+	iEnumValue := &ObjectType{Name_: "__EnumValue", Description: "Built-in introspection type"}
+	iDirective := &ObjectType{Name_: "__Directive", Description: "Built-in introspection type"}
+
+	iSchema.Fields_ = FieldMap{
+		"types":            {Type: NewNonNull(NewList(NewNonNull(iType)))},
+		"queryType":        {Type: NewNonNull(iType)},
+		"mutationType":     {Type: iType},
+		"subscriptionType": {Type: iType},
+		"directives":       {Type: NewNonNull(NewList(NewNonNull(iDirective)))},
+		"description":      {Type: StringScalar},
 	}
-	for name, obj := range introspectionTypes {
-		if _, exists := s.typeMap[name]; !exists {
-			s.typeMap[name] = obj
+	iType.Fields_ = FieldMap{
+		"kind":            {Type: NewNonNull(StringScalar)},
+		"name":            {Type: StringScalar},
+		"description":     {Type: StringScalar},
+		"fields":          {Type: NewList(NewNonNull(iField)), Args: ArgumentMap{"includeDeprecated": {Name_: "includeDeprecated", Type: BooleanScalar}}},
+		"interfaces":      {Type: NewList(NewNonNull(iType))},
+		"possibleTypes":   {Type: NewList(NewNonNull(iType))},
+		"enumValues":      {Type: NewList(NewNonNull(iEnumValue)), Args: ArgumentMap{"includeDeprecated": {Name_: "includeDeprecated", Type: BooleanScalar}}},
+		"inputFields":     {Type: NewList(NewNonNull(iInputValue)), Args: ArgumentMap{"includeDeprecated": {Name_: "includeDeprecated", Type: BooleanScalar}}},
+		"ofType":          {Type: iType},
+		"specifiedByURL":  {Type: StringScalar},
+	}
+	iField.Fields_ = FieldMap{
+		"name":              {Type: NewNonNull(StringScalar)},
+		"description":       {Type: StringScalar},
+		"args":              {Type: NewNonNull(NewList(NewNonNull(iInputValue)))},
+		"type":              {Type: NewNonNull(iType)},
+		"isDeprecated":      {Type: NewNonNull(BooleanScalar)},
+		"deprecationReason": {Type: StringScalar},
+	}
+	iInputValue.Fields_ = FieldMap{
+		"name":              {Type: NewNonNull(StringScalar)},
+		"description":       {Type: StringScalar},
+		"type":              {Type: NewNonNull(iType)},
+		"defaultValue":      {Type: StringScalar},
+		"isDeprecated":      {Type: NewNonNull(BooleanScalar)},
+		"deprecationReason": {Type: StringScalar},
+	}
+	iEnumValue.Fields_ = FieldMap{
+		"name":              {Type: NewNonNull(StringScalar)},
+		"description":       {Type: StringScalar},
+		"isDeprecated":      {Type: NewNonNull(BooleanScalar)},
+		"deprecationReason": {Type: StringScalar},
+	}
+	iDirective.Fields_ = FieldMap{
+		"name":         {Type: NewNonNull(StringScalar)},
+		"description":  {Type: StringScalar},
+		"locations":    {Type: NewNonNull(NewList(NewNonNull(StringScalar)))},
+		"args":         {Type: NewNonNull(NewList(NewNonNull(iInputValue)))},
+		"isRepeatable": {Type: NewNonNull(BooleanScalar)},
+	}
+
+	for _, obj := range []*ObjectType{iSchema, iType, iField, iInputValue, iEnumValue, iDirective} {
+		if _, exists := s.typeMap[obj.Name_]; !exists {
+			s.typeMap[obj.Name_] = obj
 		}
 	}
 

@@ -59,7 +59,7 @@ func (p *Parser) skip(kind TokenKind) bool {
 }
 
 func (p *Parser) parseDocument() (*Document, error) {
-	doc := &Document{}
+	doc := &Document{Definitions: make([]Definition, 0, 4)}
 	for !p.peek(TokenEOF) {
 		def, err := p.parseDefinition()
 		if err != nil {
@@ -193,7 +193,7 @@ func (p *Parser) parseSelectionSet() ([]Selection, error) {
 		return nil, err
 	}
 
-	var selections []Selection
+	selections := make([]Selection, 0, 4)
 	for !p.peek(TokenBraceR) && !p.peek(TokenEOF) {
 		sel, err := p.parseSelection()
 		if err != nil {
@@ -310,7 +310,7 @@ func (p *Parser) parseArguments(isConst bool) ([]*Argument, error) {
 	}
 	p.advance() // skip (
 
-	var args []*Argument
+	args := make([]*Argument, 0, 2)
 	for !p.peek(TokenParenR) && !p.peek(TokenEOF) {
 		arg, err := p.parseArgument(isConst)
 		if err != nil {
@@ -341,7 +341,10 @@ func (p *Parser) parseArgument(isConst bool) (*Argument, error) {
 }
 
 func (p *Parser) parseDirectives(isConst bool) ([]*Directive, error) {
-	var directives []*Directive
+	if !p.peek(TokenAt) {
+		return nil, nil
+	}
+	directives := make([]*Directive, 0, 2)
 	for p.peek(TokenAt) {
 		d, err := p.parseDirective(isConst)
 		if err != nil {
@@ -372,7 +375,7 @@ func (p *Parser) parseVariableDefinitions() ([]*VariableDefinition, error) {
 	}
 	p.advance() // skip (
 
-	var defs []*VariableDefinition
+	defs := make([]*VariableDefinition, 0, 2)
 	for !p.peek(TokenParenR) && !p.peek(TokenEOF) {
 		def, err := p.parseVariableDefinition()
 		if err != nil {
@@ -511,7 +514,7 @@ func (p *Parser) parseListValue(isConst bool) (Value, error) {
 	loc := Location{Line: p.cur.Line, Col: p.cur.Col}
 	p.advance() // skip [
 
-	var values []Value
+	values := make([]Value, 0, 4)
 	for !p.peek(TokenBracketR) && !p.peek(TokenEOF) {
 		val, err := p.parseValue(isConst)
 		if err != nil {
@@ -529,7 +532,7 @@ func (p *Parser) parseObjectValue(isConst bool) (Value, error) {
 	loc := Location{Line: p.cur.Line, Col: p.cur.Col}
 	p.advance() // skip {
 
-	var fields []*ObjectField
+	fields := make([]*ObjectField, 0, 4)
 	for !p.peek(TokenBraceR) && !p.peek(TokenEOF) {
 		name, err := p.expect(TokenName)
 		if err != nil {

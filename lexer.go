@@ -6,6 +6,13 @@ import (
 	"unicode/utf8"
 )
 
+// Pre-computed single-char token strings to avoid per-token string allocation.
+var punctuatorStrings = [256]string{
+	'!': "!", '$': "$", '&': "&", '(': "(", ')': ")",
+	':': ":", '=': "=", '@': "@", '[': "[", ']': "]",
+	'{': "{", '|': "|", '}': "}",
+}
+
 // Lexer tokenizes a GraphQL source document.
 type Lexer struct {
 	source string
@@ -21,7 +28,9 @@ func NewLexer(source string) *Lexer {
 
 // ReadAllTokens returns all tokens from the source.
 func (l *Lexer) ReadAllTokens() ([]Token, error) {
-	var tokens []Token
+	// Estimate token count: roughly 1 token per 6 chars for typical GraphQL
+	est := len(l.source)/6 + 4
+	tokens := make([]Token, 0, est)
 	for {
 		tok, err := l.NextToken()
 		if err != nil {
@@ -45,38 +54,18 @@ func (l *Lexer) NextToken() (Token, error) {
 
 	ch := l.source[l.pos]
 
-	// Punctuators
+	// Punctuators — fast path using pre-computed strings
 	switch ch {
-	case '!':
-		return l.singleCharToken(TokenBang), nil
-	case '$':
-		return l.singleCharToken(TokenDollar), nil
-	case '&':
-		return l.singleCharToken(TokenAmp), nil
-	case '(':
-		return l.singleCharToken(TokenParenL), nil
-	case ')':
-		return l.singleCharToken(TokenParenR), nil
-	case ':':
-		return l.singleCharToken(TokenColon), nil
-	case '=':
-		return l.singleCharToken(TokenEquals), nil
-	case '@':
-		return l.singleCharToken(TokenAt), nil
-	case '[':
-		return l.singleCharToken(TokenBracketL), nil
-	case ']':
-		return l.singleCharToken(TokenBracketR), nil
-	case '{':
-		return l.singleCharToken(TokenBraceL), nil
-	case '|':
-		return l.singleCharToken(TokenPipe), nil
-	case '}':
-		return l.singleCharToken(TokenBraceR), nil
+	case '!', '$', '&', '(', ')', ':', '=', '@', '[', ']', '{', '|', '}':
+		tok := Token{Kind: punctuatorKind[ch], Value: punctuatorStrings[ch], Line: l.line, Col: l.col}
+		l.pos++
+		l.col++
+		return tok, nil
 	case '.':
 		if l.pos+2 < len(l.source) && l.source[l.pos+1] == '.' && l.source[l.pos+2] == '.' {
 			tok := Token{Kind: TokenSpread, Value: "...", Line: l.line, Col: l.col}
-			l.advance(3)
+			l.pos += 3
+			l.col += 3
 			return tok, nil
 		}
 		return Token{}, l.syntaxError("unexpected character '.'")
@@ -100,9 +89,19 @@ func (l *Lexer) NextToken() (Token, error) {
 	return Token{}, l.syntaxError(fmt.Sprintf("unexpected character %q", ch))
 }
 
+// punctuatorKind maps ASCII chars to their TokenKind.
+var punctuatorKind = [256]TokenKind{
+	'!': TokenBang, '$': TokenDollar, '&': TokenAmp,
+	'(': TokenParenL, ')': TokenParenR,
+	':': TokenColon, '=': TokenEquals, '@': TokenAt,
+	'[': TokenBracketL, ']': TokenBracketR,
+	'{': TokenBraceL, '|': TokenPipe, '}': TokenBraceR,
+}
+
 func (l *Lexer) singleCharToken(kind TokenKind) Token {
-	tok := Token{Kind: kind, Value: string(l.source[l.pos]), Line: l.line, Col: l.col}
-	l.advance(1)
+	tok := Token{Kind: kind, Value: punctuatorStrings[l.source[l.pos]], Line: l.line, Col: l.col}
+	l.pos++
+	l.col++
 	return tok
 }
 
@@ -118,21 +117,39 @@ func (l *Lexer) advance(n int) {
 	}
 }
 
+// skipIgnored skips whitespace, commas, comments, and BOM in bulk.
 func (l *Lexer) skipIgnored() {
-	for l.pos < len(l.source) {
-		ch := l.source[l.pos]
-		switch {
-		case ch == '\xEF' && l.pos+2 < len(l.source) && l.source[l.pos+1] == '\xBB' && l.source[l.pos+2] == '\xBF':
-			// BOM
-			l.advance(3)
-		case ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == ',':
-			l.advance(1)
-		case ch == '#':
-			l.skipComment()
-		default:
-			return
+	src := l.source
+	pos := l.pos
+	for pos < len(src) {
+		ch := src[pos]
+		if ch == ' ' || ch == '\t' || ch == ',' {
+			pos++
+			l.col++
+		} else if ch == '\n' {
+			pos++
+			l.line++
+			l.col = 1
+		} else if ch == '\r' {
+			pos++
+			l.line++
+			l.col = 1
+			if pos < len(src) && src[pos] == '\n' {
+				pos++
+			}
+		} else if ch == '#' {
+			pos++
+			for pos < len(src) && src[pos] != '\n' && src[pos] != '\r' {
+				pos++
+			}
+		} else if ch == 0xEF && pos+2 < len(src) && src[pos+1] == 0xBB && src[pos+2] == 0xBF {
+			pos += 3
+			l.col += 3
+		} else {
+			break
 		}
 	}
+	l.pos = pos
 }
 
 func (l *Lexer) skipComment() {
@@ -221,7 +238,31 @@ func (l *Lexer) readString() (Token, error) {
 	l.pos++ // skip opening '"'
 	l.col++
 
+	// Fast path: scan for simple strings without escapes
+	start := l.pos
+	for l.pos < len(l.source) {
+		ch := l.source[l.pos]
+		if ch == '"' {
+			val := l.source[start:l.pos]
+			l.pos++
+			l.col += len(val) + 1
+			return Token{Kind: TokenString, Value: val, Line: startLine, Col: startCol}, nil
+		}
+		if ch == '\\' {
+			// Has escapes — fall back to builder
+			break
+		}
+		if ch == '\n' || ch == '\r' {
+			return Token{}, l.syntaxError("unterminated string")
+		}
+		l.pos++
+	}
+
+	// Slow path: string with escape sequences
 	var sb strings.Builder
+	sb.WriteString(l.source[start:l.pos])
+	l.col += l.pos - start
+
 	for {
 		if l.pos >= len(l.source) {
 			return Token{}, l.syntaxError("unterminated string")
