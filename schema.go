@@ -1,0 +1,258 @@
+package gqlx
+
+// Schema represents a GraphQL schema.
+type Schema struct {
+	QueryType        *ObjectType
+	MutationType     *ObjectType
+	SubscriptionType *ObjectType
+	Directives_      []*DirectiveDefinition
+	typeMap          map[string]GraphQLType
+	implementations  map[string][]*ObjectType
+}
+
+// SchemaConfig is the configuration for building a schema.
+type SchemaConfig struct {
+	Query        *ObjectType
+	Mutation     *ObjectType
+	Subscription *ObjectType
+	Types        []GraphQLType
+	Directives   []*DirectiveDefinition
+}
+
+// NewSchema creates a new schema from the given configuration.
+func NewSchema(config SchemaConfig) (*Schema, error) {
+	if config.Query == nil {
+		return nil, &GraphQLError{Message: "Must provide Query type"}
+	}
+
+	s := &Schema{
+		QueryType:        config.Query,
+		MutationType:     config.Mutation,
+		SubscriptionType: config.Subscription,
+		typeMap:          make(map[string]GraphQLType),
+		implementations:  make(map[string][]*ObjectType),
+	}
+
+	if len(config.Directives) > 0 {
+		s.Directives_ = config.Directives
+	} else {
+		s.Directives_ = BuiltInDirectives()
+	}
+
+	// Collect all types
+	s.collectTypes(config.Query)
+	if config.Mutation != nil {
+		s.collectTypes(config.Mutation)
+	}
+	if config.Subscription != nil {
+		s.collectTypes(config.Subscription)
+	}
+	for _, t := range config.Types {
+		s.collectTypes(t)
+	}
+
+	// Always include built-in scalars
+	for _, scalar := range []*ScalarType{IntScalar, FloatScalar, StringScalar, BooleanScalar, IDScalar} {
+		if _, exists := s.typeMap[scalar.Name_]; !exists {
+			s.typeMap[scalar.Name_] = scalar
+		}
+	}
+
+	// Include introspection types so they pass validation
+	introspectionTypes := map[string]*ObjectType{
+		"__Schema": {
+			Name_:       "__Schema",
+			Description: "Built-in introspection type",
+			Fields_: FieldMap{
+				"types":            {Type: NewNonNull(NewList(NewNonNull(&ObjectType{Name_: "__Type"})))},
+				"queryType":        {Type: NewNonNull(&ObjectType{Name_: "__Type"})},
+				"mutationType":     {Type: &ObjectType{Name_: "__Type"}},
+				"subscriptionType": {Type: &ObjectType{Name_: "__Type"}},
+				"directives":       {Type: NewNonNull(NewList(NewNonNull(&ObjectType{Name_: "__Directive"})))},
+				"description":      {Type: StringScalar},
+			},
+		},
+		"__Type": {
+			Name_:       "__Type",
+			Description: "Built-in introspection type",
+			Fields_: FieldMap{
+				"kind":          {Type: NewNonNull(StringScalar)},
+				"name":          {Type: StringScalar},
+				"description":   {Type: StringScalar},
+				"fields":        {Type: NewList(NewNonNull(&ObjectType{Name_: "__Field"})), Args: ArgumentMap{"includeDeprecated": {Name_: "includeDeprecated", Type: BooleanScalar}}},
+				"interfaces":    {Type: NewList(NewNonNull(&ObjectType{Name_: "__Type"}))},
+				"possibleTypes": {Type: NewList(NewNonNull(&ObjectType{Name_: "__Type"}))},
+				"enumValues":    {Type: NewList(NewNonNull(&ObjectType{Name_: "__EnumValue"})), Args: ArgumentMap{"includeDeprecated": {Name_: "includeDeprecated", Type: BooleanScalar}}},
+				"inputFields":   {Type: NewList(NewNonNull(&ObjectType{Name_: "__InputValue"})), Args: ArgumentMap{"includeDeprecated": {Name_: "includeDeprecated", Type: BooleanScalar}}},
+				"ofType":        {Type: &ObjectType{Name_: "__Type"}},
+				"specifiedByURL": {Type: StringScalar},
+			},
+		},
+		"__Field": {
+			Name_:       "__Field",
+			Description: "Built-in introspection type",
+			Fields_: FieldMap{
+				"name":              {Type: NewNonNull(StringScalar)},
+				"description":       {Type: StringScalar},
+				"args":              {Type: NewNonNull(NewList(NewNonNull(&ObjectType{Name_: "__InputValue"})))},
+				"type":              {Type: NewNonNull(&ObjectType{Name_: "__Type"})},
+				"isDeprecated":      {Type: NewNonNull(BooleanScalar)},
+				"deprecationReason": {Type: StringScalar},
+			},
+		},
+		"__InputValue": {
+			Name_:       "__InputValue",
+			Description: "Built-in introspection type",
+			Fields_: FieldMap{
+				"name":              {Type: NewNonNull(StringScalar)},
+				"description":       {Type: StringScalar},
+				"type":              {Type: NewNonNull(&ObjectType{Name_: "__Type"})},
+				"defaultValue":      {Type: StringScalar},
+				"isDeprecated":      {Type: NewNonNull(BooleanScalar)},
+				"deprecationReason": {Type: StringScalar},
+			},
+		},
+		"__EnumValue": {
+			Name_:       "__EnumValue",
+			Description: "Built-in introspection type",
+			Fields_: FieldMap{
+				"name":              {Type: NewNonNull(StringScalar)},
+				"description":       {Type: StringScalar},
+				"isDeprecated":      {Type: NewNonNull(BooleanScalar)},
+				"deprecationReason": {Type: StringScalar},
+			},
+		},
+		"__Directive": {
+			Name_:       "__Directive",
+			Description: "Built-in introspection type",
+			Fields_: FieldMap{
+				"name":         {Type: NewNonNull(StringScalar)},
+				"description":  {Type: StringScalar},
+				"locations":    {Type: NewNonNull(NewList(NewNonNull(StringScalar)))},
+				"args":         {Type: NewNonNull(NewList(NewNonNull(&ObjectType{Name_: "__InputValue"})))},
+				"isRepeatable": {Type: NewNonNull(BooleanScalar)},
+			},
+		},
+	}
+	for name, obj := range introspectionTypes {
+		if _, exists := s.typeMap[name]; !exists {
+			s.typeMap[name] = obj
+		}
+	}
+
+	// Build implementations map
+	for _, t := range s.typeMap {
+		if obj, ok := t.(*ObjectType); ok {
+			for _, iface := range obj.Interfaces_ {
+				s.implementations[iface.Name_] = append(s.implementations[iface.Name_], obj)
+			}
+		}
+	}
+
+	return s, nil
+}
+
+func (s *Schema) collectTypes(t GraphQLType) {
+	if t == nil {
+		return
+	}
+
+	switch typ := t.(type) {
+	case *ListOfType:
+		s.collectTypes(typ.OfType)
+		return
+	case *NonNullOfType:
+		s.collectTypes(typ.OfType)
+		return
+	}
+
+	name := t.TypeName()
+	if name == "" {
+		return
+	}
+	if _, exists := s.typeMap[name]; exists {
+		return
+	}
+	s.typeMap[name] = t
+
+	switch typ := t.(type) {
+	case *ObjectType:
+		for _, iface := range typ.Interfaces_ {
+			s.collectTypes(iface)
+		}
+		for _, field := range typ.Fields_ {
+			s.collectTypes(field.Type)
+			for _, arg := range field.Args {
+				s.collectTypes(arg.Type)
+			}
+		}
+	case *InterfaceType:
+		for _, field := range typ.Fields_ {
+			s.collectTypes(field.Type)
+			for _, arg := range field.Args {
+				s.collectTypes(arg.Type)
+			}
+		}
+	case *UnionType:
+		for _, member := range typ.Types {
+			s.collectTypes(member)
+		}
+	case *InputObjectType:
+		for _, field := range typ.Fields_ {
+			s.collectTypes(field.Type)
+		}
+	case *EnumType:
+		// no further types to collect
+	case *ScalarType:
+		// no further types to collect
+	}
+}
+
+// TypeMap returns all types in the schema.
+func (s *Schema) TypeMap() map[string]GraphQLType {
+	return s.typeMap
+}
+
+// Type returns a type by name.
+func (s *Schema) Type(name string) GraphQLType {
+	return s.typeMap[name]
+}
+
+// GetImplementations returns all object types that implement the given interface.
+func (s *Schema) GetImplementations(iface *InterfaceType) []*ObjectType {
+	return s.implementations[iface.Name_]
+}
+
+// IsPossibleType returns true if the given type is a possible type for the abstract type.
+func (s *Schema) IsPossibleType(abstractType GraphQLType, objectType *ObjectType) bool {
+	switch at := abstractType.(type) {
+	case *InterfaceType:
+		for _, impl := range s.implementations[at.Name_] {
+			if impl == objectType {
+				return true
+			}
+		}
+	case *UnionType:
+		for _, member := range at.Types {
+			if member == objectType {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Directives returns all directives in the schema.
+func (s *Schema) Directives() []*DirectiveDefinition {
+	return s.Directives_
+}
+
+// Directive returns a directive by name.
+func (s *Schema) Directive(name string) *DirectiveDefinition {
+	for _, d := range s.Directives_ {
+		if d.Name_ == name {
+			return d
+		}
+	}
+	return nil
+}
