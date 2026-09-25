@@ -41,11 +41,16 @@ func FederationDirectives() []*DirectiveDefinition {
 // ReferenceResolver resolves an entity from a representation containing __typename and key fields.
 type ReferenceResolver func(representation map[string]interface{}) (interface{}, error)
 
+// BatchReferenceResolver resolves many entity representations in one call. It is
+// optional; when provided it lets the planner avoid the N+1 entity fetch problem.
+type BatchReferenceResolver func(representations []map[string]interface{}) ([]interface{}, error)
+
 // EntityDefinition defines how an entity type is resolved in a subgraph.
 type EntityDefinition struct {
-	TypeName  string
-	KeyFields []string
-	Resolver  ReferenceResolver
+	TypeName      string
+	KeyFields     []string
+	Resolver      ReferenceResolver
+	BatchResolver BatchReferenceResolver
 }
 
 // Subgraph represents a federation subgraph service.
@@ -64,9 +69,10 @@ type SubgraphConfig struct {
 
 // EntityConfig configures an entity type within a subgraph.
 type EntityConfig struct {
-	TypeName  string
-	KeyFields []string
-	Resolver  ReferenceResolver
+	TypeName      string
+	KeyFields     []string
+	Resolver      ReferenceResolver
+	BatchResolver BatchReferenceResolver
 }
 
 // NewSubgraph creates a new federation subgraph.
@@ -93,9 +99,10 @@ func NewSubgraph(config SubgraphConfig) (*Subgraph, error) {
 			return nil, fmt.Errorf("subgraph %q: entity %q must have a reference resolver", config.Name, e.TypeName)
 		}
 		entities[e.TypeName] = &EntityDefinition{
-			TypeName:  e.TypeName,
-			KeyFields: e.KeyFields,
-			Resolver:  e.Resolver,
+			TypeName:      e.TypeName,
+			KeyFields:     e.KeyFields,
+			Resolver:      e.Resolver,
+			BatchResolver: e.BatchResolver,
 		}
 	}
 

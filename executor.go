@@ -1,10 +1,17 @@
 package gqlx
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
+	"sync"
 )
+
+// errNonNullViolation signals that a non-null field completed to null. It
+// propagates up to the nearest nullable parent, which itself resolves to null,
+// exactly as required by the GraphQL specification.
+var errNonNullViolation = errors.New("non-null field resolved to null")
 
 // Executor executes GraphQL operations.
 type Executor struct {
@@ -18,12 +25,13 @@ func NewExecutor(schema *Schema) *Executor {
 
 // ExecuteParams holds the parameters for executing a GraphQL operation.
 type ExecuteParams struct {
-	Schema         *Schema
-	Document       *Document
-	RootValue      interface{}
-	Variables      map[string]interface{}
-	OperationName  string
-	MaxDepth       int // 0 means no limit
+	Schema        *Schema
+	Document      *Document
+	RootValue     interface{}
+	Variables     map[string]interface{}
+	OperationName string
+	MaxDepth      int  // 0 means no limit
+	Concurrent    bool // resolve sibling query fields concurrently
 }
 
 // Execute executes a GraphQL document.
@@ -33,40 +41,19 @@ func (e *Executor) Execute(params ExecuteParams) *Result {
 	if schema == nil {
 		schema = e.schema
 	}
-
-	// Find the operation
-	var operation *OperationDefinition
-	fragments := make(map[string]*FragmentDefinition)
-
-	for _, def := range doc.Definitions {
-		switch d := def.(type) {
-		case *OperationDefinition:
-			if params.OperationName == "" {
-				if operation != nil {
-					return &Result{Errors: []*GraphQLError{{Message: "Must provide operation name if query contains multiple operations."}}}
-				}
-				operation = d
-			} else if d.Name == params.OperationName {
-				operation = d
-			}
-		case *FragmentDefinition:
-			fragments[d.Name] = d
-		}
+	if schema == nil {
+		return &Result{Errors: []*GraphQLError{{Message: "Must provide schema"}}}
+	}
+	if doc == nil {
+		return &Result{Errors: []*GraphQLError{{Message: "Must provide document"}}}
 	}
 
-	if operation == nil {
-		if params.OperationName != "" {
-			return &Result{Errors: []*GraphQLError{{Message: fmt.Sprintf("Unknown operation named \"%s\".", params.OperationName)}}}
-		}
-		return &Result{Errors: []*GraphQLError{{Message: "Must provide an operation."}}}
+	operation, fragments, err := findOperation(doc, params.OperationName)
+	if err != nil {
+		return &Result{Errors: []*GraphQLError{err}}
 	}
 
-	// Coerce variables
-	variables := params.Variables
-	if variables == nil {
-		variables = make(map[string]interface{})
-	}
-	coercedVars, varErrors := CoerceVariableValues(schema, operation.VariableDefinitions, variables)
+	coercedVars, varErrors := coerceOperationVariables(schema, operation, params.Variables)
 	if len(varErrors) > 0 {
 		return &Result{Errors: varErrors}
 	}
@@ -86,53 +73,162 @@ func (e *Executor) Execute(params ExecuteParams) *Result {
 		return &Result{Errors: []*GraphQLError{{Message: fmt.Sprintf("Schema is not configured for %ss.", operation.Operation)}}}
 	}
 
-	ctx := &executionContext{
-		schema:    schema,
-		fragments: fragments,
-		variables: coercedVars,
-		errors:    nil,
-		operation: operation,
-		maxDepth:  params.MaxDepth,
-	}
-
-	rootValue := params.RootValue
+	ctx := newExecutionContext(schema, operation, fragments, coercedVars, params.MaxDepth)
+	ctx.concurrent = params.Concurrent
 
 	var data interface{}
+	var execErr error
 	if operation.Operation == OperationMutation {
-		data = ctx.executeFieldsSerially(rootType, rootValue, operation.SelectionSet, []interface{}{})
+		// Mutations must be executed serially per the GraphQL specification.
+		data, execErr = ctx.executeFieldsSerially(rootType, params.RootValue, operation.SelectionSet, []interface{}{})
 	} else {
-		data = ctx.executeFields(rootType, rootValue, operation.SelectionSet, []interface{}{})
+		data, execErr = ctx.executeFields(rootType, params.RootValue, operation.SelectionSet, []interface{}{})
+	}
+	// A non-null root field that resolved to null turns the whole data entry null.
+	if execErr != nil {
+		data = nil
 	}
 
-	return &Result{Data: data, Errors: ctx.errors}
+	return &Result{Data: data, Errors: ctx.Errors()}
+}
+
+// findOperation locates the operation to execute and collects fragment definitions.
+func findOperation(doc *Document, operationName string) (*OperationDefinition, map[string]*FragmentDefinition, *GraphQLError) {
+	var operation *OperationDefinition
+	fragments := make(map[string]*FragmentDefinition)
+
+	for _, def := range doc.Definitions {
+		switch d := def.(type) {
+		case *OperationDefinition:
+			if operationName == "" {
+				if operation != nil {
+					return nil, nil, &GraphQLError{Message: "Must provide operation name if query contains multiple operations."}
+				}
+				operation = d
+			} else if d.Name == operationName {
+				operation = d
+			}
+		case *FragmentDefinition:
+			fragments[d.Name] = d
+		}
+	}
+
+	if operation == nil {
+		if operationName != "" {
+			return nil, nil, &GraphQLError{Message: fmt.Sprintf("Unknown operation named \"%s\".", operationName)}
+		}
+		return nil, nil, &GraphQLError{Message: "Must provide an operation."}
+	}
+	return operation, fragments, nil
+}
+
+// coerceOperationVariables applies variable default values and coercion.
+func coerceOperationVariables(schema *Schema, operation *OperationDefinition, variables map[string]interface{}) (map[string]interface{}, []*GraphQLError) {
+	if variables == nil {
+		variables = make(map[string]interface{})
+	}
+	return CoerceVariableValues(schema, operation.VariableDefinitions, variables)
 }
 
 type executionContext struct {
-	schema    *Schema
-	fragments map[string]*FragmentDefinition
-	variables map[string]interface{}
-	errors    []*GraphQLError
-	operation *OperationDefinition
-	maxDepth  int
+	schema     *Schema
+	fragments  map[string]*FragmentDefinition
+	variables  map[string]interface{}
+	errors     []*GraphQLError
+	operation  *OperationDefinition
+	maxDepth   int
+	concurrent bool
+	mu         sync.Mutex
 }
 
-func (ctx *executionContext) executeFields(parentType *ObjectType, source interface{}, selections []Selection, path []interface{}) map[string]interface{} {
+func newExecutionContext(schema *Schema, operation *OperationDefinition, fragments map[string]*FragmentDefinition, variables map[string]interface{}, maxDepth int) *executionContext {
+	return &executionContext{
+		schema:    schema,
+		operation: operation,
+		fragments: fragments,
+		variables: variables,
+		maxDepth:  maxDepth,
+	}
+}
+
+// Errors returns a snapshot of the accumulated execution errors.
+func (ctx *executionContext) Errors() []*GraphQLError {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+	return ctx.errors
+}
+
+func (ctx *executionContext) executeFields(parentType *ObjectType, source interface{}, selections []Selection, path []interface{}) (map[string]interface{}, error) {
 	groupedFields := ctx.collectFields(parentType, selections, nil)
-	result := make(map[string]interface{})
+	if ctx.concurrent {
+		return ctx.executeFieldsConcurrently(parentType, source, groupedFields, path)
+	}
+	return ctx.executeGroupedFields(parentType, source, groupedFields, path)
+}
+
+func (ctx *executionContext) executeFieldsSerially(parentType *ObjectType, source interface{}, selections []Selection, path []interface{}) (map[string]interface{}, error) {
+	groupedFields := ctx.collectFields(parentType, selections, nil)
+	return ctx.executeGroupedFields(parentType, source, groupedFields, path)
+}
+
+// executeGroupedFields resolves each field in order. If any non-null field
+// resolves to null, the enclosing object itself resolves to null.
+func (ctx *executionContext) executeGroupedFields(parentType *ObjectType, source interface{}, groupedFields []fieldEntry, path []interface{}) (map[string]interface{}, error) {
+	result := make(map[string]interface{}, len(groupedFields))
+	nonNullViolated := false
 
 	for _, entry := range groupedFields {
-		responseName := entry.key
-		fieldNodes := entry.fields
-		fieldPath := append(append([]interface{}{}, path...), responseName)
-		result[responseName] = ctx.resolveField(parentType, source, fieldNodes, fieldPath)
+		fieldPath := append(append([]interface{}{}, path...), entry.key)
+		value, err := ctx.resolveField(parentType, source, entry.fields, fieldPath)
+		if err != nil {
+			nonNullViolated = true
+			continue
+		}
+		result[entry.key] = value
 	}
 
-	return result
+	if nonNullViolated {
+		return nil, errNonNullViolation
+	}
+	return result, nil
 }
 
-func (ctx *executionContext) executeFieldsSerially(parentType *ObjectType, source interface{}, selections []Selection, path []interface{}) map[string]interface{} {
-	// For mutations, fields are executed serially (same as executeFields in Go since we're single-threaded)
-	return ctx.executeFields(parentType, source, selections, path)
+// executeFieldsConcurrently resolves sibling fields in parallel. It is opt-in
+// via ExecuteParams.Concurrent and is not used for mutations.
+func (ctx *executionContext) executeFieldsConcurrently(parentType *ObjectType, source interface{}, groupedFields []fieldEntry, path []interface{}) (map[string]interface{}, error) {
+	result := make(map[string]interface{}, len(groupedFields))
+	values := make([]interface{}, len(groupedFields))
+	failed := make([]bool, len(groupedFields))
+
+	var wg sync.WaitGroup
+	for i, entry := range groupedFields {
+		wg.Add(1)
+		go func(i int, entry fieldEntry) {
+			defer wg.Done()
+			fieldPath := append(append([]interface{}{}, path...), entry.key)
+			value, err := ctx.resolveField(parentType, source, entry.fields, fieldPath)
+			if err != nil {
+				failed[i] = true
+				return
+			}
+			values[i] = value
+		}(i, entry)
+	}
+	wg.Wait()
+
+	nonNullViolated := false
+	for i, entry := range groupedFields {
+		if failed[i] {
+			nonNullViolated = true
+			continue
+		}
+		result[entry.key] = values[i]
+	}
+
+	if nonNullViolated {
+		return nil, errNonNullViolation
+	}
+	return result, nil
 }
 
 type fieldEntry struct {
@@ -247,16 +343,16 @@ func (ctx *executionContext) doesFragmentApply(typeName string, objectType *Obje
 	return ctx.schema.IsPossibleType(t, objectType)
 }
 
-func (ctx *executionContext) resolveField(parentType *ObjectType, source interface{}, fieldNodes []*Field, path []interface{}) interface{} {
+func (ctx *executionContext) resolveField(parentType *ObjectType, source interface{}, fieldNodes []*Field, path []interface{}) (interface{}, error) {
 	fieldNode := fieldNodes[0]
 	fieldName := fieldNode.Name
 
 	// Handle introspection fields
 	if fieldName == "__typename" {
-		return parentType.Name_
+		return parentType.Name_, nil
 	}
 	if fieldName == "__schema" && parentType == ctx.schema.QueryType {
-		return ctx.resolveIntrospectionSchema(fieldNode, path)
+		return ctx.resolveIntrospectionSchema(fieldNode, path), nil
 	}
 	if fieldName == "__type" && parentType == ctx.schema.QueryType {
 		args, _ := CoerceArgumentValues(
@@ -265,21 +361,21 @@ func (ctx *executionContext) resolveField(parentType *ObjectType, source interfa
 		typeName, _ := args["name"].(string)
 		t := ctx.schema.Type(typeName)
 		if t == nil {
-			return nil
+			return nil, nil
 		}
-		return ctx.resolveIntrospectionType(t, fieldNode, path)
+		return ctx.resolveIntrospectionType(t, fieldNode, path), nil
 	}
 
 	fieldDef, ok := parentType.Fields_[fieldName]
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	// Resolve arguments
 	args, err := CoerceArgumentValues(fieldDef.Args, fieldNode.Arguments, ctx.variables)
 	if err != nil {
 		ctx.addError(err.Error(), fieldNode.Loc, path)
-		return nil
+		return nil, ctx.fieldError(fieldDef.Type)
 	}
 
 	// Resolve field value
@@ -302,30 +398,51 @@ func (ctx *executionContext) resolveField(parentType *ObjectType, source interfa
 		result, err = fieldDef.Resolve(resolveParams)
 		if err != nil {
 			ctx.addError(err.Error(), fieldNode.Loc, path)
-			return ctx.handleNullPropagation(fieldDef.Type)
+			return nil, ctx.fieldError(fieldDef.Type)
 		}
 	} else {
 		result = resolveFieldValue(source, fieldName)
 	}
 
-	return ctx.completeValue(fieldDef.Type, fieldNodes, result, path)
+	completed, cerr := ctx.completeValue(fieldDef.Type, fieldNodes, result, path)
+	if cerr != nil {
+		return nil, ctx.fieldError(fieldDef.Type)
+	}
+	return completed, nil
 }
 
-func (ctx *executionContext) completeValue(typ GraphQLType, fieldNodes []*Field, result interface{}, path []interface{}) interface{} {
+// fieldError decides whether a completion failure propagates past the current
+// field. A nullable field swallows the failure and resolves to null; a non-null
+// field propagates it to the parent so that the parent resolves to null.
+func (ctx *executionContext) fieldError(typ GraphQLType) error {
+	if _, isNonNull := typ.(*NonNullOfType); isNonNull {
+		return errNonNullViolation
+	}
+	return nil
+}
+
+// completeValue turns a resolved value into a response value according to its
+// type. It returns errNonNullViolation when a non-null position completed to
+// null; the caller at a nullable boundary converts that into a JSON null.
+func (ctx *executionContext) completeValue(typ GraphQLType, fieldNodes []*Field, result interface{}, path []interface{}) (interface{}, error) {
 	// NonNull
 	if nn, ok := typ.(*NonNullOfType); ok {
-		completed := ctx.completeValue(nn.OfType, fieldNodes, result, path)
+		completed, err := ctx.completeValue(nn.OfType, fieldNodes, result, path)
+		if err != nil {
+			// A nested non-null violation already recorded its error; propagate it.
+			return nil, err
+		}
 		if completed == nil {
 			ctx.addError(
 				"Cannot return null for non-nullable field.",
 				fieldNodes[0].Loc, path)
-			return nil
+			return nil, errNonNullViolation
 		}
-		return completed
+		return completed, nil
 	}
 
 	if result == nil {
-		return nil
+		return nil, nil
 	}
 
 	// List
@@ -335,7 +452,7 @@ func (ctx *executionContext) completeValue(typ GraphQLType, fieldNodes []*Field,
 
 	// Leaf
 	if IsLeafType(typ) {
-		return ctx.completeLeafValue(typ, result)
+		return ctx.completeLeafValue(typ, fieldNodes, result, path)
 	}
 
 	// Abstract
@@ -348,32 +465,45 @@ func (ctx *executionContext) completeValue(typ GraphQLType, fieldNodes []*Field,
 		return ctx.completeObjectValue(obj, fieldNodes, result, path)
 	}
 
-	return nil
+	return nil, nil
 }
 
-func (ctx *executionContext) completeListValue(listType *ListOfType, fieldNodes []*Field, result interface{}, path []interface{}) interface{} {
+func (ctx *executionContext) completeListValue(listType *ListOfType, fieldNodes []*Field, result interface{}, path []interface{}) (interface{}, error) {
 	rv := reflect.ValueOf(result)
 	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
 		ctx.addError("Expected iterable, did not find one.", fieldNodes[0].Loc, path)
-		return nil
+		return nil, errNonNullViolation
 	}
 
+	// If elements are non-null, a failing element nulls the whole list.
+	// If elements are nullable, a failing element becomes null and others survive.
+	_, itemNonNull := listType.OfType.(*NonNullOfType)
+	itemNullable := !itemNonNull
 	items := make([]interface{}, rv.Len())
 	for i := 0; i < rv.Len(); i++ {
 		itemPath := append(append([]interface{}{}, path...), i)
-		items[i] = ctx.completeValue(listType.OfType, fieldNodes, rv.Index(i).Interface(), itemPath)
+		item, err := ctx.completeValue(listType.OfType, fieldNodes, rv.Index(i).Interface(), itemPath)
+		if err != nil {
+			if itemNullable {
+				items[i] = nil
+				continue
+			}
+			return nil, err
+		}
+		items[i] = item
 	}
-	return items
+	return items, nil
 }
 
-func (ctx *executionContext) completeLeafValue(typ GraphQLType, result interface{}) interface{} {
+func (ctx *executionContext) completeLeafValue(typ GraphQLType, fieldNodes []*Field, result interface{}, path []interface{}) (interface{}, error) {
 	switch t := typ.(type) {
 	case *ScalarType:
 		val, err := t.Serialize(result)
 		if err != nil {
-			return nil
+			ctx.addError(err.Error(), fieldNodes[0].Loc, path)
+			return nil, errNonNullViolation
 		}
-		return val
+		return val, nil
 	case *EnumType:
 		s := fmt.Sprintf("%v", result)
 		for _, ev := range t.Values {
@@ -382,15 +512,16 @@ func (ctx *executionContext) completeLeafValue(typ GraphQLType, result interface
 				val = fmt.Sprintf("%v", ev.Value)
 			}
 			if val == s || ev.Name_ == s {
-				return ev.Name_
+				return ev.Name_, nil
 			}
 		}
-		return nil
+		ctx.addError(fmt.Sprintf("Enum \"%s\" cannot represent value: %v", t.Name_, result), fieldNodes[0].Loc, path)
+		return nil, errNonNullViolation
 	}
-	return nil
+	return nil, nil
 }
 
-func (ctx *executionContext) completeAbstractValue(abstractType GraphQLType, fieldNodes []*Field, result interface{}, path []interface{}) interface{} {
+func (ctx *executionContext) completeAbstractValue(abstractType GraphQLType, fieldNodes []*Field, result interface{}, path []interface{}) (interface{}, error) {
 	var objectType *ObjectType
 
 	switch at := abstractType.(type) {
@@ -421,13 +552,13 @@ func (ctx *executionContext) completeAbstractValue(abstractType GraphQLType, fie
 		ctx.addError(
 			fmt.Sprintf("Abstract type \"%s\" must resolve to an Object type at runtime.", abstractType.TypeName()),
 			fieldNodes[0].Loc, path)
-		return nil
+		return nil, errNonNullViolation
 	}
 
 	return ctx.completeObjectValue(objectType, fieldNodes, result, path)
 }
 
-func (ctx *executionContext) completeObjectValue(objectType *ObjectType, fieldNodes []*Field, result interface{}, path []interface{}) interface{} {
+func (ctx *executionContext) completeObjectValue(objectType *ObjectType, fieldNodes []*Field, result interface{}, path []interface{}) (interface{}, error) {
 	// Enforce max depth: count only string elements in path (skip list indices)
 	if ctx.maxDepth > 0 {
 		depth := 0
@@ -440,7 +571,7 @@ func (ctx *executionContext) completeObjectValue(objectType *ObjectType, fieldNo
 			ctx.addError(
 				fmt.Sprintf("Query depth %d exceeds maximum allowed depth of %d.", depth, ctx.maxDepth),
 				fieldNodes[0].Loc, path)
-			return nil
+			return nil, errNonNullViolation
 		}
 	}
 
@@ -451,17 +582,15 @@ func (ctx *executionContext) completeObjectValue(objectType *ObjectType, fieldNo
 	}
 
 	if len(subSelections) == 0 {
-		return result
+		return result, nil
 	}
 
 	return ctx.executeFields(objectType, result, subSelections, path)
 }
 
-func (ctx *executionContext) handleNullPropagation(_ GraphQLType) interface{} {
-	return nil
-}
-
 func (ctx *executionContext) addError(message string, loc Location, path []interface{}) {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
 	ctx.errors = append(ctx.errors, &GraphQLError{
 		Message:   message,
 		Locations: []ErrorLocation{{Line: loc.Line, Column: loc.Col}},
@@ -649,11 +778,11 @@ func (b *introspectionBuilder) buildTypeObj(t GraphQLType) map[string]interface{
 	if b.visited[t] {
 		// Return a minimal reference
 		return map[string]interface{}{
-			"__typename": "__Type",
-			"kind":       typeKindString(t),
-			"name":       t.TypeName(),
+			"__typename":  "__Type",
+			"kind":        typeKindString(t),
+			"name":        t.TypeName(),
 			"description": nil,
-			"fields": nil, "inputFields": nil, "interfaces": nil,
+			"fields":      nil, "inputFields": nil, "interfaces": nil,
 			"enumValues": nil, "possibleTypes": nil, "ofType": nil,
 		}
 	}

@@ -101,7 +101,16 @@ func (g *Gateway) compose() (*Schema, error) {
 			case *ObjectType:
 				if existing, ok := mergedObjects[name]; ok {
 					for fn, fd := range t.Fields_ {
-						if _, exists := existing.Fields_[fn]; !exists {
+						if fd.External {
+							// External fields are placeholders owned by another subgraph;
+							// only add one if the type does not already declare the field.
+							if _, exists := existing.Fields_[fn]; !exists {
+								existing.Fields_[fn] = fd
+							}
+							continue
+						}
+						// A locally owned definition wins over an external placeholder.
+						if cur, exists := existing.Fields_[fn]; !exists || cur.External {
 							existing.Fields_[fn] = fd
 						}
 						if g.fieldOwner[name][fn] == nil {
@@ -112,7 +121,7 @@ func (g *Gateway) compose() (*Schema, error) {
 					clonedFields := make(FieldMap, len(t.Fields_))
 					for fn, fd := range t.Fields_ {
 						clonedFields[fn] = fd
-						if g.fieldOwner[name][fn] == nil {
+						if !fd.External && g.fieldOwner[name][fn] == nil {
 							g.fieldOwner[name][fn] = sg
 						}
 					}
@@ -146,8 +155,16 @@ func (g *Gateway) compose() (*Schema, error) {
 				Args:              rewriteArgs(fd.Args, mergedObjects),
 				Resolve:           fd.Resolve,
 				DeprecationReason: fd.DeprecationReason,
+				External:          fd.External,
+				Requires:          fd.Requires,
+				Provides:          fd.Provides,
 			}
 		}
+	}
+
+	// Phase 2b: Validate federation metadata now that references are resolved.
+	if err := validateFederationMetadata(mergedObjects); err != nil {
+		return nil, err
 	}
 
 	// Phase 3: Wire up entity-crossing resolvers
@@ -169,7 +186,10 @@ func (g *Gateway) compose() (*Schema, error) {
 				Type:              fd.Type,
 				Args:              fd.Args,
 				DeprecationReason: fd.DeprecationReason,
-				Resolve:           makeEntityFieldResolver(typeName, fieldName, ownerSg, entity),
+				External:          fd.External,
+				Requires:          fd.Requires,
+				Provides:          fd.Provides,
+				Resolve:           makeEntityFieldResolver(typeName, fieldName, ownerSg, entity, fd.Requires),
 			}
 		}
 	}
@@ -351,7 +371,7 @@ func wireRootResolvers(rootType *ObjectType, fieldOwner map[string]map[string]*S
 // makeEntityFieldResolver creates a field resolver that handles cross-subgraph entity resolution.
 // When the field's data isn't in the source (came from a different subgraph), it resolves the
 // entity via the owning subgraph's reference resolver.
-func makeEntityFieldResolver(typeName, fieldName string, sg *Subgraph, entity *EntityDefinition) ResolveFunc {
+func makeEntityFieldResolver(typeName, fieldName string, sg *Subgraph, entity *EntityDefinition, requires []string) ResolveFunc {
 	return func(p ResolveParams) (interface{}, error) {
 		source, ok := p.Source.(map[string]interface{})
 		if !ok {
@@ -379,6 +399,15 @@ func makeEntityFieldResolver(typeName, fieldName string, sg *Subgraph, entity *E
 				return nil, fmt.Errorf("federation: missing key field %q on %s for entity resolution in subgraph %q", kf, typeName, sg.Name)
 			}
 			repr[kf] = val
+		}
+		// Include any fields required by @requires so the reference resolver can use them.
+		for _, rf := range requires {
+			if _, exists := repr[rf]; exists {
+				continue
+			}
+			if val, exists := source[rf]; exists {
+				repr[rf] = val
+			}
 		}
 
 		// Resolve entity from the owning subgraph
@@ -441,4 +470,31 @@ func isBuiltInType(name string) bool {
 		return true
 	}
 	return false
+}
+
+// validateFederationMetadata verifies that @requires and @provides reference
+// fields that actually exist in the composed supergraph.
+func validateFederationMetadata(mergedObjects map[string]*ObjectType) error {
+	for typeName, obj := range mergedObjects {
+		for fieldName, fd := range obj.Fields_ {
+			for _, req := range fd.Requires {
+				if _, ok := obj.Fields_[req]; !ok {
+					return fmt.Errorf("federation: field %s.%s has @requires for unknown field %q", typeName, fieldName, req)
+				}
+			}
+			if len(fd.Provides) == 0 {
+				continue
+			}
+			retObj, ok := UnwrapType(fd.Type).(*ObjectType)
+			if !ok {
+				return fmt.Errorf("federation: field %s.%s has @provides but does not return an object type", typeName, fieldName)
+			}
+			for _, provided := range fd.Provides {
+				if _, ok := retObj.Fields_[provided]; !ok {
+					return fmt.Errorf("federation: field %s.%s has @provides for unknown field %q on %s", typeName, fieldName, provided, retObj.Name_)
+				}
+			}
+		}
+	}
+	return nil
 }

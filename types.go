@@ -10,10 +10,10 @@ type GraphQLType interface {
 
 // ScalarType represents a GraphQL scalar type.
 type ScalarType struct {
-	Name_       string
-	Description string
-	Serialize   func(value interface{}) (interface{}, error)
-	ParseValue  func(value interface{}) (interface{}, error)
+	Name_        string
+	Description  string
+	Serialize    func(value interface{}) (interface{}, error)
+	ParseValue   func(value interface{}) (interface{}, error)
 	ParseLiteral func(value Value) (interface{}, error)
 }
 
@@ -43,6 +43,14 @@ type FieldDefinition struct {
 	Args              ArgumentMap
 	Resolve           ResolveFunc
 	DeprecationReason string
+
+	// Federation metadata (see the Apollo Federation v2 directives).
+	// External marks a field whose value is owned by another subgraph.
+	// Requires lists fields that must be resolved before this field can be.
+	// Provides lists fields this field's return type provides for a related entity.
+	External bool
+	Requires []string
+	Provides []string
 }
 
 // ArgumentMap is a map of argument name to argument definition.
